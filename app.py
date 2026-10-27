@@ -1,8 +1,11 @@
 import json
+import sqlite3
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from twin.plant import Plant, Settings
+from twin.storage import ExperimentStore
+from twin.experiments import compare
 
 st.set_page_config(page_title='AQUA • Industrial Digital Twin', page_icon='💧', layout='wide')
 st.markdown('''<style>
@@ -16,7 +19,7 @@ if 'plant' not in st.session_state:
 
 with st.sidebar:
     st.title('💧 AQUA')
-    st.caption('INDUSTRIAL DIGITAL TWIN / v0.1')
+    st.caption('INDUSTRIAL DIGITAL TWIN / v0.2')
     st.divider()
     mode = st.selectbox('Control mode', ['Automatic', 'Manual'])
     enabled = st.toggle('Pump enabled', True)
@@ -34,10 +37,18 @@ with st.sidebar:
         leak = st.slider('Leak at full tank (L/s)', 0.0, 15.0, 0.0, 0.5)
         bias = st.slider('Level sensor bias (m)', -1.0, 1.0, 0.0, 0.1)
         cooling = st.toggle('Cooling failure')
+    with st.expander('Station configuration', expanded=True):
+        strategy = st.selectbox('Pump strategy', ['Single','Standby','Assist','Balanced'])
+        profile = st.selectbox('Demand profile', ['Constant','Step','Cyclic'])
+        trip = st.toggle('Trip pump 1')
+        noise = st.slider('Sensor noise σ (m)', 0.0, 0.1, 0.0, 0.01)
+        filter_tau = st.slider('Sensor filter time constant (s)', 0.0, 5.0, 1.0, 0.25)
     st.caption('Faults remain active until you clear their controls.')
 
 cfg = Settings(target, demand/1000, mode, manual/100, kp, ki, kd,
-               blockage/100, leak/1000, bias, cooling, enabled)
+               blockage/100, leak/1000, bias, cooling, enabled,
+               pumps=1 if strategy=='Single' else 2, strategy=strategy,
+               pump_trip=trip, noise=noise, filter_tau=filter_tau, profile=profile)
 st.caption('OPERATIONS / VIRTUAL PUMPING STATION')
 st.title('Your plant. In real time.')
 st.write('Explore water dynamics, tune the controller and investigate equipment faults.')
@@ -67,7 +78,7 @@ def live():
         [f"{row['level_m']:.2f} m", f"{row['inflow_ls']:.1f} L/s", f"{row['speed_pct']:.0f}%",
          f"{row['pressure_bar']:.2f} bar", f"{row['temperature_c']:.1f} °C", f"{row['energy_kwh']:.4f} kWh"]):
         col.metric(label, value)
-    overview, trends, diagnostics, export = st.tabs(['Station overview', 'Process trends', 'Diagnostics', 'Export & model'])
+    overview, trends, diagnostics, lab, export = st.tabs(['Station overview', 'Process trends', 'Diagnostics', 'Experiment lab', 'Export & model'])
     df = pd.DataFrame(p.rows)
     with overview:
         left, right = st.columns([1,2])
@@ -79,25 +90,58 @@ def live():
             fig.update_layout(height=310, margin=dict(t=45,b=20,l=30,r=30), paper_bgcolor='rgba(0,0,0,0)', font_color='#e2edf5')
             st.plotly_chart(fig, width='stretch')
         with right:
-            st.subheader('Supply → motor & pump → pipe → tank → demand')
+            st.subheader('Parallel pumping station')
+            st.write(f"**Strategy:** {cfg.strategy} · **Lead pump:** {p.lead+1} · **Assist:** {'active' if p.lag else 'off'}")
+            st.write(f"Pump 1: {row['speed_pct']:.0f}% / {row['pump1_flow_ls']:.1f} L/s · Pump 2: {row['pump2_speed_pct']:.0f}% / {row['pump2_flow_ls']:.1f} L/s")
+            st.caption(f"Runtime P1/P2: {p.runtime[0]:.0f}/{p.runtime[1]:.0f} s · Starts: {p.starts[0]}/{p.starts[1]}")
             st.progress(min(1.0, row['level_m']/5), text=f"Tank volume: {row['level_m']*4:.1f} / 20 m³")
             st.write(f"**Delivered:** {row['delivered_ls']:.1f} L/s  ·  **Leak:** {row['leak_ls']:.1f} L/s  ·  **Overflow:** {row['overflow_ls']:.1f} L/s")
             if alerts:
                 for alert in alerts: st.warning(alert)
             else: st.success('Process indicators within configured thresholds.')
-        chart(df, ['level_m','target_m','measured_level_m'], 'Tank level & setpoint', 'Level (m)')
+        chart(df, ['level_m','target_m','measured_level_m','filtered_level_m'], 'Tank level & setpoint', 'Level (m)')
     with trends:
         x,y=st.columns(2)
         with x:
             chart(df,['inflow_ls','demand_ls','delivered_ls','leak_ls'],'Water balance','Flow (L/s)')
             chart(df,['power_kw'],'Electrical load','Power (kW)')
         with y:
-            chart(df,['speed_pct'],'Motor drive','Speed (%)')
-            chart(df,['temperature_c'],'Motor thermal response','Temperature (°C)')
+            chart(df,['speed_pct','pump2_speed_pct'],'Motor drive','Speed (%)')
+            chart(df,['temperature_c','pump2_temperature_c'],'Motor thermal response','Temperature (°C)')
     with diagnostics:
         st.caption('Rule-based physics checks. These are suspected conditions, not a trained predictive maintenance model.')
         st.dataframe(pd.DataFrame(p.events[::-1], columns=['time_s','event']), width='stretch', hide_index=True)
         st.info('Sensor disagreement assumes an independent reference level measurement. Water loss assumes independent inlet and outlet metering. Fault injection supplies those virtual instruments.')
+    with lab:
+        st.subheader('Compare pump scheduling strategies')
+        st.caption('Four independent 600-second experiments start from the same initial state and random seed. Current controls and faults apply to every run. Results do not change the live plant. Balanced lead rotation occurs every 300 seconds.')
+        if st.button('Run strategy comparison'):
+            with st.spinner('Simulating four stations…'):
+                st.session_state.comparison = compare(cfg, 600)
+                st.session_state.comparison_cfg = vars(cfg).copy()
+        if 'comparison' in st.session_state:
+            st.dataframe(pd.DataFrame(st.session_state.comparison), width='stretch', hide_index=True)
+            if st.session_state.comparison_cfg != vars(cfg):
+                st.warning('Controls changed since this comparison. Run again to update results.')
+            st.download_button('Download comparison CSV', pd.DataFrame(st.session_state.comparison).to_csv(index=False), 'strategy_comparison.csv')
+        st.divider()
+        st.subheader('Experiment archive')
+        st.caption('Save an explicit snapshot of the retained history, events and the latest 1,000 settings changes to a local SQLite database. Saved runs survive app restarts on this machine. Shared hosting may erase local files.')
+        name = st.text_input('Experiment name', 'Pump station experiment')
+        try:
+            store = ExperimentStore()
+            if st.button('Save current snapshot'):
+                store.save(name, p)
+                st.success('Snapshot saved.')
+            saved = store.list()
+            if saved:
+                selected = st.selectbox('Saved experiment', [r['id'] for r in saved],
+                    format_func=lambda identity: next(r['name']+' · '+r['created'][:19] for r in saved if r['id']==identity))
+                payload = store.load(selected)
+                st.download_button('Download saved experiment JSON', json.dumps(payload,indent=2), 'saved_experiment.json')
+                st.dataframe(pd.DataFrame(payload['rows']).iloc[::max(1,len(payload['rows'])//100)], width='stretch', hide_index=True)
+        except (OSError, sqlite3.Error) as exc:
+            st.error(f'Experiment archive unavailable: {exc}')
     with export:
         st.download_button('Download operating history (CSV)', df.to_csv(index=False), 'operating_history.csv','text/csv')
         st.download_button('Download experiment settings', json.dumps(cfg.__dict__,indent=2),'experiment.json','application/json')
@@ -107,9 +151,9 @@ Tank balance: `A dh/dt = Qin − Qdelivered − Qleak − Qoverflow`.
 
 Pump curve: `H = 18 n² − R Q²`, with `R = 8000/(1 − blockage)²`.
 
-Power: `P = ρgQH/0.68 + 120n²`. Temperature follows a lumped heat balance.
+Power per pump: `P = ρgQH/0.68 + 120n²`. Parallel branch flows are summed; each branch has the same static tank head and its own resistance. Temperatures follow separate lumped heat balances.
 
-History retains the latest 6,000 samples (20 simulated minutes). Exports contain this retained window. Energy is cumulative since Reset. Sessions are independent and memory-only.
+History retains the latest 6,000 samples (20 simulated minutes). Exports contain this retained window. Energy is cumulative since Reset. Live sessions are independent and memory-only. Explicit experiment snapshots persist in SQLite. Step demand increases by 60% at 60 s; cyclic demand varies ±40% with a 180 s period. Noise is seeded Gaussian; PID uses an exponential sensor filter.
 
 This is an educational simulation, with assumed parameters; it has not been calibrated against physical equipment. No real equipment connection or remaining-life prediction is included.''')
 

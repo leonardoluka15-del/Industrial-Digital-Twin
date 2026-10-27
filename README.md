@@ -56,3 +56,30 @@ Tests cover mass conservation including overflow, setpoint convergence, blockage
 - `.streamlit/config.toml`: dashboard theme
 
 No API keys, paid services or GPU required.
+
+## Version 0.2 — advanced station
+
+- **Two parallel pump branches:** separate motor dynamics, temperatures, operating hours and start counters.
+- **Standby:** pump 2 takes over when pump 1 trips. A trip overrides its command; its rotor coasts down.
+- **Assist:** pump 2 joins when filtered tank level drops 0.35 m below target and leaves above target minus 0.05 m. Both receive a common speed command; feedforward divides demand between commanded pumps.
+- **Balanced:** the lead pump rotates every 300 simulated seconds. This is timed rotation rather than a wear-optimized scheduler.
+- **Demand profiles:** constant, a 60% step increase at 60 seconds, or sinusoidal ±40% demand over 180 seconds.
+- **Sensor processing:** reproducible Gaussian noise, adjustable bias and a first-order exponential filter for the PID measurement. Truth remains visible for simulation evaluation.
+- **Experiment lab:** compare four scheduling strategies over 600 seconds with identical initial conditions, controls, faults and noise seed. Scores include tracking RMSE, energy per delivered volume, unmet demand and overflow. Comparison runs are independent of the live process.
+- **Archive:** explicit SQLite snapshots include retained telemetry, diagnostic events and the latest 1,000 control-setting changes. Download archived experiments as JSON. Archives do not restore/resume simulator state.
+
+The archive is created in `data/experiments.db` on your machine. It survives local app restarts but is not a hosted database, and all users of a shared server can access its archive. Do not use this prototype for private multi-user data. Export experiments before moving installations.
+
+Each pump uses an independent branch resistance and the same static tank head; there is no shared header loss model. Blockage applies to both branches. Cooling failure affects pump 1; pump 2 has normal cooling. The single-pump speed/temperature indicators refer to pump 1; the station panel and trends show pump 2 separately. A disabled station stops both commands. Threshold diagnostics are illustrative, without debounce or learned fault classification.
+
+### Update an existing Windows installation
+
+Stop the app with Ctrl+C. Download the latest GitHub ZIP and extract to a new folder. Open that folder and run:
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m streamlit run app.py
+```
+
+Alternatively, when updating files in place, retain your existing `.venv` and `data` folder, install requirements again, and restart the app. Do not copy an old `app.py` or `twin` folder over the new release.
